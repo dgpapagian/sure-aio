@@ -1,0 +1,163 @@
+# Builds this sure-aio fork and publishes it to ghcr.io/<your-user>/sure-aio.
+#
+# - Daily: checks for a new stable Sure release (any v* tag that isn't an alpha,
+#   which is what upstream publishes as ghcr.io/we-promise/sure:stable). If one
+#   exists, bumps the Dockerfile pins, builds, boot-tests, pushes, then commits
+#   the bump.
+# - Manual run (Actions tab > Run workflow): always builds, also bumping first if
+#   upstream has moved.
+# - Push to main touching the image sources: rebuilds the current pin.
+#
+# Nothing is pushed to the registry unless the image boots and /up returns 200.
+
+name: Build sure-aio
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * *"
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - rootfs/**
+      - docker/**
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-sure-aio
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve latest stable Sure release
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version=$(sed -n 's/^ARG UPSTREAM_VERSION=//p' Dockerfile)
+          current_digest=$(sed -n 's/^ARG UPSTREAM_IMAGE_DIGEST=//p' Dockerfile)
+
+          latest_tag=$(git ls-remote --tags --refs https://github.com/we-promise/sure.git \
+            | sed 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+            | grep -viE -- '-(alpha|beta|rc)' \
+            | sort -V | tail -n1)
+          latest_version="${latest_tag#v}"
+
+          if ! latest_digest=$(docker buildx imagetools inspect "ghcr.io/we-promise/sure:${latest_version}" \
+                --format '{{json .Manifest}}' | jq -re .digest); then
+            echo "::warning::Upstream image for ${latest_version} isn't published yet; staying on ${current_version}."
+            latest_version="$current_version"
+            latest_digest="$current_digest"
+          fi
+
+          echo "Pinned:   ${current_version} @ ${current_digest}"
+          echo "Upstream: ${latest_version} @ ${latest_digest}"
+
+          bumped=false
+          if [ "$latest_version" != "$current_version" ] || [ "$latest_digest" != "$current_digest" ]; then
+            bumped=true
+            sed -i "s/^ARG UPSTREAM_VERSION=.*/ARG UPSTREAM_VERSION=${latest_version}/" Dockerfile
+            sed -i "s/^ARG UPSTREAM_IMAGE_DIGEST=.*/ARG UPSTREAM_IMAGE_DIGEST=${latest_digest}/" Dockerfile
+          fi
+
+          build=$bumped
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
+            build=true
+          fi
+
+          {
+            echo "version=${latest_version}"
+            echo "bumped=${bumped}"
+            echo "build=${build}"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sure-aio"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        if: steps.upstream.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: sure-aio:smoke
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot test (must answer /up with 200)
+        if: steps.upstream.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 3000:3000 \
+            -e SECRET_KEY_BASE="$(openssl rand -hex 64)" \
+            -e SELF_HOSTED=true \
+            -e RAILS_FORCE_SSL=false \
+            -e RAILS_ASSUME_SSL=false \
+            -e ONBOARDING_STATE=open \
+            sure-aio:smoke
+          for _ in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/up || true)
+            if [ "$code" = "200" ]; then
+              echo "Container is healthy."
+              docker exec smoke cat /rails/.sure-version
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Container did not become healthy within 7.5 minutes."
+          docker logs smoke 2>&1 | tail -n 200
+          exit 1
+
+      - name: Log in to GHCR
+        if: steps.upstream.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push image
+        if: steps.upstream.outputs.build == 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          for tag in latest "$VERSION"; do
+            docker tag sure-aio:smoke "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+          done
+
+      - name: Commit version bump
+        if: steps.upstream.outputs.bumped == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "chore: bump Sure to ${VERSION}"
+          git push
